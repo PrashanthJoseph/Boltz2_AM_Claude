@@ -40,7 +40,6 @@ class SearchConfig:
     beta: float = 0.5          # exploration weight (static -- U(x) already decays
                                 # organically as the pool fills in nearby, so a
                                 # separate time-based anneal was redundant)
-    gamma: float = 0.2         # batch-diversity weight (greedy parent selection only)
     # U(x) = novelty = nearest-neighbor Hamming distance / n_design (no radius
     # parameter needed -- "how far is the closest thing already tried")
 
@@ -72,7 +71,6 @@ class SearchConfig:
     patience_generations: int = 8
     max_boltz2_calls: int = 3000
 
-    p_cap: Optional[int] = None  # caps only the parent-eligible active pool, never dedup/density
     elitism: bool = True
 
     # Safety policy (LAP severities, hydrophobic patch length) is NOT here --
@@ -507,32 +505,18 @@ def run_search(
             0.0, -((parent_delta / mad_parent_delta) + (bracket_delta / mad_bracket_delta))
         )
 
-        order = np.argsort(-base_score)
-        if config.p_cap is not None and len(order) > config.p_cap:
-            eligible = set(order[: config.p_cap].tolist())
-        else:
-            eligible = set(order.tolist())
+        order = np.argsort(-base_score)  # all pool indices, descending by base_score
 
         elite_idx = int(np.argmax(objective))
-        if config.elitism:
-            eligible.add(elite_idx)
-
-        eligible_list = sorted(eligible, key=lambda i: -base_score[i])
 
         selected: List[int] = []
         if config.elitism:
             selected.append(elite_idx)
-        remaining = [i for i in eligible_list if i not in selected]
-        while len(selected) < config.k_parents and remaining:
-            if not selected:
-                pick = remaining[0]
-            else:
-                def eff(i: int) -> float:
-                    min_d = min(hamming(design_strings[i], design_strings[s]) for s in selected)
-                    return base_score[i] + config.gamma * (min_d / n_design)
-                pick = max(remaining, key=eff)
-            selected.append(pick)
-            remaining.remove(pick)
+        for i in order.tolist():
+            if len(selected) >= config.k_parents:
+                break
+            if i not in selected:
+                selected.append(i)
 
         new_records: List[Tuple[str, int, int, str]] = []  # (design, parent_index, step, move_type)
         jumps_used: Dict[int, int] = {}
