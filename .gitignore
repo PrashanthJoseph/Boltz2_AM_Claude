@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+universe_facts/
+*.log
+.claude/
