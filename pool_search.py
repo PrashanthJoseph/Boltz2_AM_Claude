@@ -104,11 +104,20 @@ class SearchConfig:
 @dataclass
 class PoolMember:
     design: str          # the 7-character designable substring
-    score: float          # raw S(x) from the oracle, in its native convention
+    score: float          # S(x) from the oracle -- the combined log-reward the
+                          # search ranks on (higher is better under score_sign=+1)
     generation: int
     parent_index: Optional[int]
     step: int             # Hamming distance to immediate parent (0 for root)
     move_type: Optional[str] = None  # "increase" / "decrease" / "lateral" / None for root
+    # Raw Boltz-2 components behind score, kept for logging/reporting so the
+    # combined S(x) can be read back in native affinity terms. None when the
+    # score_fn didn't supply them (e.g. a plain-ndarray score_fn). affinity_value
+    # is the raw -3..+3 pred (LOWER is better); affinity_probability is 0..~0.95
+    # (HIGHER is better). See boltz2_reward.compute_log_reward for how they
+    # combine into score.
+    affinity_value: Optional[float] = None
+    affinity_probability: Optional[float] = None
 
 
 # ============================================================
@@ -427,9 +436,16 @@ class BitmapSafetyChecker:
 
 def run_search(
     config: SearchConfig,
-    score_fn: Callable[[Sequence[str]], np.ndarray],
+    # score_fn(full_seqs) may return EITHER a plain np.ndarray of S(x) scores,
+    # OR a tuple (scores, extras) where extras is a per-candidate list of dicts
+    # carrying raw oracle components ({"affinity_value": v, "affinity_probability": p}).
+    # The tuple form is what lets the writable log record raw Boltz-2 affinity /
+    # probability alongside the combined score; a plain ndarray still works and
+    # just logs those columns as blank. See _split_score_return below.
+    score_fn: Callable[[Sequence[str]], object],
     safety_checker: SafetyChecker,
     rng: Optional[np.random.Generator] = None,
+    log_path: Optional[str] = None,
 ) -> Dict:
     rng = rng or np.random.default_rng()
     design_positions = config.designable_positions
@@ -440,16 +456,72 @@ def run_search(
     seen = set()
 
     def add_member(design: str, score: float, generation: int, parent_index: Optional[int],
-                   step: int, move_type: Optional[str] = None) -> None:
+                   step: int, move_type: Optional[str] = None,
+                   affinity_value: Optional[float] = None,
+                   affinity_probability: Optional[float] = None) -> None:
         pool.append(PoolMember(design=design, score=score, generation=generation,
-                                parent_index=parent_index, step=step, move_type=move_type))
+                                parent_index=parent_index, step=step, move_type=move_type,
+                                affinity_value=affinity_value,
+                                affinity_probability=affinity_probability))
         design_strings.append(design)
         seen.add(design)
 
+    # ---- writable per-candidate score log (optional) ----------------------
+    # One CSV row per candidate, appended at the moment it is scored, so the
+    # file survives a mid-run crash (the expensive Boltz-2 JSON outputs are
+    # independently persisted by the score_fn too). normalized_objective here
+    # is a SNAPSHOT against the pool as it stood when the candidate entered --
+    # the search itself recomputes normalized_objective every generation for
+    # ranking, so a member's logged value is its standing at insertion time,
+    # not necessarily the exact value used in a later generation's selection.
+    log_file = None
+    log_writer = None
+    if log_path is not None:
+        import csv
+        log_file = open(log_path, "w", newline="")
+        log_writer = csv.writer(log_file)
+        log_writer.writerow([
+            "generation", "design", "parent_index", "step", "move_type",
+            "boltz_affinity_value", "boltz_probability", "S_score",
+            "normalized_objective",
+        ])
+        log_file.flush()
+
+    def write_log_rows(member_indices: Sequence[int]) -> None:
+        if log_writer is None:
+            return
+        obj_all = config.score_sign * np.array([m.score for m in pool])
+        med = np.median(obj_all)
+        mad = robust_mad(obj_all)
+        for i in member_indices:
+            m = pool[i]
+            nobj = (config.score_sign * m.score - med) / mad
+            log_writer.writerow([
+                m.generation, m.design, m.parent_index, m.step, m.move_type,
+                m.affinity_value, m.affinity_probability, m.score, float(nobj),
+            ])
+        log_file.flush()
+
+    def _split_score_return(ret):
+        """Normalize score_fn's return into (scores_array, extras_list)."""
+        if isinstance(ret, tuple):
+            scores, extras = ret
+            return np.asarray(scores, dtype=float), list(extras)
+        arr = np.asarray(ret, dtype=float)
+        return arr, [None] * len(arr)
+
+    def _vp(extra) -> Tuple[Optional[float], Optional[float]]:
+        if not extra:
+            return None, None
+        return extra.get("affinity_value"), extra.get("affinity_probability")
+
     root_design = initial_design_string(config.root_sequence, design_positions)
     root_full = assemble_full_sequence(config.root_sequence, design_positions, root_design)
-    root_score = float(score_fn([root_full])[0])
-    add_member(root_design, root_score, generation=0, parent_index=None, step=0)
+    root_scores, root_extras = _split_score_return(score_fn([root_full]))
+    root_v, root_p = _vp(root_extras[0])
+    add_member(root_design, float(root_scores[0]), generation=0, parent_index=None, step=0,
+               affinity_value=root_v, affinity_probability=root_p)
+    write_log_rows([len(pool) - 1])
 
     calls_made = 1
     generations_without_improve = 0
@@ -582,12 +654,16 @@ def run_search(
             continue
 
         full_seqs = [assemble_full_sequence(config.root_sequence, design_positions, d) for d, _, _, _ in new_records]
-        new_scores = score_fn(full_seqs)
+        new_scores, new_extras = _split_score_return(score_fn(full_seqs))
         calls_made += len(full_seqs)
 
         prev_best = float(objective.max())
-        for (design, parent_idx, step, mv), s in zip(new_records, new_scores):
-            add_member(design, float(s), generation, parent_idx, step, mv)
+        first_new_idx = len(pool)
+        for (design, parent_idx, step, mv), s, extra in zip(new_records, new_scores, new_extras):
+            v, p = _vp(extra)
+            add_member(design, float(s), generation, parent_idx, step, mv,
+                       affinity_value=v, affinity_probability=p)
+        write_log_rows(range(first_new_idx, len(pool)))
 
         cur_best = float((config.score_sign * np.array([m.score for m in pool])).max())
         generations_without_improve = 0 if cur_best > prev_best + 1e-9 else generations_without_improve + 1
@@ -608,5 +684,8 @@ def run_search(
             "elite_combined_badness": float(combined_badness[elite_idx]),
             "n_gated_out": n_gated_out,
         })
+
+    if log_file is not None:
+        log_file.close()
 
     return {"pool": pool, "log": log, "calls_made": calls_made}

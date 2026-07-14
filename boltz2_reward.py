@@ -150,7 +150,14 @@ def compute_log_reward(affinity_probability_binary: float, affinity_pred_value: 
 
 class Boltz2ScoreFn:
     """
-    Callable matching pool_search's score_fn(full_seqs) -> np.ndarray contract.
+    Callable matching pool_search's score_fn contract. Returns a tuple
+    (scores, extras): `scores` is the np.ndarray of combined S(x) log-rewards
+    the search ranks on, and `extras` is a per-candidate list of dicts with the
+    raw Boltz-2 components {"affinity_value", "affinity_probability"} behind
+    each score. pool_search.run_search accepts this tuple form and uses the
+    extras to populate the writable score log; it also still accepts a plain
+    ndarray, so returning the raw components is optional from its side.
+
     full_seqs are the assembled 17-residue CDRH3 strings pool_search produces
     internally (config.root_sequence's length) -- NOT the whole antibody.
     This wraps each one into the full heavy chain + light chain + ligand
@@ -167,7 +174,7 @@ class Boltz2ScoreFn:
         self.boltz_kwargs = boltz_kwargs
         self._counter = 0
 
-    def __call__(self, full_seqs: List[str]) -> np.ndarray:
+    def __call__(self, full_seqs: List[str]) -> Tuple[np.ndarray, List[dict]]:
         start = self._counter
         self._counter += len(full_seqs)
 
@@ -184,7 +191,11 @@ class Boltz2ScoreFn:
             raise RuntimeError(f"Boltz batch prediction failed for {batch_id} (see stderr above)")
 
         scores = np.zeros(len(full_seqs))
+        extras: List[dict] = []
         for i, unique_id in enumerate(unique_ids):
             data = read_affinity_json(out_dir, unique_id)
-            scores[i] = compute_log_reward(data["affinity_probability_binary"], data["affinity_pred_value"])
-        return scores
+            v = float(data["affinity_pred_value"])
+            p = float(data["affinity_probability_binary"])
+            scores[i] = compute_log_reward(p, v)
+            extras.append({"affinity_value": v, "affinity_probability": p})
+        return scores, extras
