@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -63,10 +64,21 @@ class SearchConfig:
 
     k_parents: int = 8
     k_children_per_parent: int = 8
-    # Child proposal enumerates the FULL reachable neighborhood per move type
-    # and safety-checks all of it up front (see propose_safe_children /
-    # enumerate_neighborhood) -- true selection from a known-safe population,
-    # not generate-a-guess-and-retry, so there's no oversample/retry knob here.
+    # enumerate_threshold: child proposal picks its strategy per (move, jump)
+    # from the closed-form neighborhood size C(m,jump)*choices^jump (no
+    # materialization needed to know it):
+    #   size <= threshold  -> enumerate the FULL neighborhood, safety-check it
+    #                         in one batch, sample from the known-safe set.
+    #                         Exhaustive, so it also detects near-exhaustion
+    #                         for free -- cheap because the set is small.
+    #   size >  threshold  -> construct candidates directly (O(jump) each),
+    #                         safety-check a small batch via precomputed facts,
+    #                         never building the ~C(m,jump)*choices^jump set.
+    # Default keeps jump-1 (<=133) and jump-2 (<=7581) fully enumerated --
+    # identical to prior behavior -- and switches only large jump-3
+    # neighborhoods (up to 240,065) to constructive sampling, killing the
+    # 19^jump blow-up exactly where it hurt. See propose_safe_children.
+    enumerate_threshold: int = 20000
 
     patience_generations: int = 8
     max_boltz2_calls: int = 3000
@@ -254,6 +266,73 @@ def enumerate_neighborhood(parent_design: str, root_design: str, move: str, jump
     return out
 
 
+# Constructive-sampling tuning for the large-neighborhood path in
+# propose_safe_children. OVERSAMPLE draws a few extra per round to absorb the
+# unsafe/already-seen fraction (safe fraction is ~64% universe-wide, so ~2x is
+# ample); MAX_ROUNDS bounds the loop so a pathologically constrained (but
+# still above-threshold) neighborhood can't spin forever -- it just returns a
+# short pool, which the selection loop already tolerates.
+_SAMPLE_OVERSAMPLE = 2
+_MAX_SAMPLE_ROUNDS = 8
+
+
+def neighborhood_size(move: str, jump: int, n_mutated: int, n_unmutated: int) -> int:
+    """
+    Closed-form size of enumerate_neighborhood(move, jump) WITHOUT building it:
+    C(m, jump) * (choices-per-position)^jump. Lets propose_safe_children decide
+    enumerate-vs-sample from the count alone. choices-per-position is 19 for
+    increase (any AA != root's residue), 18 for lateral (any AA != root's and
+    != parent's current), 1 for decrease (revert to root -- deterministic).
+    Returns 0 when the eligible position set is smaller than jump (infeasible).
+    """
+    if move == "increase":
+        m, per = n_unmutated, len(AA_ALPHABET) - 1
+    elif move == "lateral":
+        m, per = n_mutated, len(AA_ALPHABET) - 2
+    else:  # decrease
+        m, per = n_mutated, 1
+    if m < jump:
+        return 0
+    return math.comb(m, jump) * (per ** jump)
+
+
+def construct_child(
+    parent_design: str,
+    root_design: str,
+    move: str,
+    jump: int,
+    mutated_idx: Sequence[int],
+    unmutated_idx: Sequence[int],
+    rng: np.random.Generator,
+) -> str:
+    """
+    Directly construct ONE uniform-random candidate of the given move type at
+    this jump size -- O(jump), with no neighborhood materialization. Identical
+    edit semantics to enumerate_neighborhood, just sampled rather than listed:
+    a draw here is distributionally the same as picking a random element of
+    that move's enumerated set, so swapping enumerate->construct for large
+    neighborhoods doesn't change the child distribution, only the cost.
+    """
+    candidate = list(parent_design)
+    if move == "increase":
+        k = min(jump, len(unmutated_idx))
+        for p in rng.choice(unmutated_idx, size=k, replace=False):
+            choices = [a for a in AA_ALPHABET if a != root_design[p]]
+            candidate[p] = rng.choice(choices)
+    elif move == "decrease":
+        k = min(jump, len(mutated_idx))
+        for p in rng.choice(mutated_idx, size=k, replace=False):
+            candidate[p] = root_design[p]
+    else:  # lateral
+        k = min(jump, len(mutated_idx))
+        for p in rng.choice(mutated_idx, size=k, replace=False):
+            choices = [a for a in AA_ALPHABET if a != root_design[p] and a != candidate[p]]
+            if not choices:
+                continue
+            candidate[p] = rng.choice(choices)
+    return "".join(candidate)
+
+
 def propose_safe_children(
     parent_design: str,
     root_design: str,
@@ -263,16 +342,30 @@ def propose_safe_children(
     safety_checker: "SafetyChecker",
     rng: np.random.Generator,
     move_weights: Optional[Dict[str, float]] = None,
+    enumerate_threshold: int = 20000,
 ) -> List[Tuple[str, str]]:
     """
-    Real selection, not rejection sampling: for each feasible move type,
-    enumerate the ENTIRE reachable neighborhood at this jump size, safety-check
-    all of it in one vectorized call, then sample target_n from the resulting
-    known-safe population -- proportioned across move types by move_weights,
-    with any shortfall (a move type running out of safe candidates) filled
-    from whichever other feasible move type still has some left, in weight
-    order. Every candidate considered here is already guaranteed safe before
-    it's ever picked, since the whole neighborhood was checked up front.
+    Builds a known-safe candidate pool per feasible move type, then samples
+    target_n children from those pools -- proportioned across move types by
+    move_weights (per-child weighted draw; the ratio emerges as an expectation,
+    not an exact count), with any shortfall filled from whichever other move
+    still has candidates left.
+
+    The pool for each move is built by ONE OF TWO strategies, chosen from the
+    closed-form neighborhood size (see neighborhood_size), never by trial:
+      - size <= enumerate_threshold: enumerate the entire reachable
+        neighborhood, filter to fresh (unseen), safety-check in one batch, keep
+        the safe ones. Exhaustive -> also handles the near-exhaustion regime
+        for free, and is cheap precisely because the set is small.
+      - size >  enumerate_threshold: construct candidates directly (O(jump)
+        each) in bounded rounds, safety-check each small batch, accumulate the
+        safe+fresh ones until target_n are found. Never materializes the
+        ~C(m,jump)*choices^jump neighborhood -- this is what removes the
+        19^jump blow-up at large jumps, where the exhaustive guarantee was
+        worthless anyway (safe fresh candidates are abundant there).
+    Either way every candidate offered to the selection step is already
+    confirmed safe (safety is a precomputed per-sequence fact under
+    BitmapSafetyChecker, so the check is an O(1) lookup per candidate).
     """
     weights = move_weights if move_weights is not None else DEFAULT_MOVE_WEIGHTS
     n = len(parent_design)
@@ -288,15 +381,46 @@ def propose_safe_children(
     if not feasible:
         return []
 
+    def batch_safe_fresh(cands: Sequence[str]) -> List[str]:
+        """Dedup vs already_seen (and within this batch), drop unsafe; order preserved."""
+        local: set = set()
+        fresh: List[str] = []
+        for c in cands:
+            if c in already_seen or c in local:
+                continue
+            local.add(c)
+            fresh.append(c)
+        if not fresh:
+            return []
+        mask = safety_checker.is_safe(fresh)
+        return [c for c, ok in zip(fresh, mask) if ok]
+
     safe_by_move: Dict[str, List[str]] = {}
     for move in feasible:
-        candidates = enumerate_neighborhood(parent_design, root_design, move, jump)
-        fresh = [c for c in candidates if c not in already_seen]
-        if fresh:
-            safe_mask = safety_checker.is_safe(fresh)
-            safe = [c for c, ok in zip(fresh, safe_mask) if ok]
+        size = neighborhood_size(move, jump, len(mutated_idx), len(unmutated_idx))
+        if size == 0:
+            safe_by_move[move] = []
+            continue
+
+        if size <= enumerate_threshold:
+            candidates = enumerate_neighborhood(parent_design, root_design, move, jump)
+            safe = batch_safe_fresh(candidates)
         else:
             safe = []
+            safe_set: set = set()
+            for _ in range(_MAX_SAMPLE_ROUNDS):
+                if len(safe) >= target_n:
+                    break
+                draw = _SAMPLE_OVERSAMPLE * (target_n - len(safe)) + 2
+                raw = [
+                    construct_child(parent_design, root_design, move, jump,
+                                    mutated_idx, unmutated_idx, rng)
+                    for _ in range(draw)
+                ]
+                for c in batch_safe_fresh(raw):
+                    if c not in safe_set:
+                        safe.append(c)
+                        safe_set.add(c)
         rng.shuffle(safe)
         safe_by_move[move] = safe
 
@@ -641,6 +765,7 @@ def run_search(
             accepted = propose_safe_children(
                 parent_design, root_design, jump, config.k_children_per_parent,
                 seen, safety_checker, rng, move_weights=config.move_weights,
+                enumerate_threshold=config.enumerate_threshold,
             )
 
             for cand, mv in accepted:
