@@ -73,6 +73,28 @@ class SearchConfig:
 
     elitism: bool = True
 
+    # fitness_gate_tau: quality gate on parent ELIGIBILITY. A member is
+    # parent-eligible only if its normalized_objective is no more than tau
+    # MADs BELOW the pool MEDIAN; everything further behind is excluded from
+    # selection REGARDLESS of how novel it is. This caps the "novelty rescue"
+    # ceiling (novelty can lift base_score by at most beta*(U_max - U_min)
+    # ~= 0.43 MAD, so without a gate an isolated mediocre member can
+    # persistently hold a parent slot in a sparse space).
+    #
+    # Reference is the MEDIAN, not the best: normalized_objective is already
+    # median-centered ((obj-med)/MAD), so the gate is simply "z >= -tau". This
+    # is deliberately robust to a runaway-best outlier -- a best-relative gate
+    # (AdaLead's mu*max_score analog) collapses to elite-only when one early
+    # hit sits many MADs above the pack, throttling exploration; the median is
+    # stable under that. The gate still excludes genuinely-bad members (well
+    # below typical) but never prunes members sitting near the pool's middle.
+    #
+    # None (default) = OFF, preserving prior behavior. The elite is always
+    # exempt (elitism re-adds it below), so the gate can never strand the
+    # best-found member. Sensible values are ~2-3 (MAD is scaled to std-like
+    # units, so tau reads as "how many sigma below typical is still allowed").
+    fitness_gate_tau: Optional[float] = None
+
     # Safety policy (LAP severities, hydrophobic patch length) is NOT here --
     # it lives entirely in whichever SafetyChecker object is passed to
     # run_search(), so it stays in one place instead of two configs that
@@ -509,12 +531,29 @@ def run_search(
 
         elite_idx = int(np.argmax(objective))
 
+        # Fitness gate (optional quality floor): a member is parent-eligible
+        # only if its normalized_objective is no more than tau MADs below the
+        # pool median. normalized_objective is already median-centered and in
+        # MAD units, so the gate is just "z >= -tau". This runs on RAW fitness
+        # (no novelty term) on purpose -- the whole point is to stop novelty
+        # from keeping a low-scoring member eligible. The elite is exempt
+        # (re-added via elitism below), so the gate can never strand the
+        # best-found member even if numerical edge cases would exclude it.
+        if config.fitness_gate_tau is not None:
+            eligible_mask = normalized_objective >= -config.fitness_gate_tau
+            eligible_mask[elite_idx] = True
+        else:
+            eligible_mask = np.ones(len(pool), dtype=bool)
+        n_gated_out = int((~eligible_mask).sum())
+
         selected: List[int] = []
         if config.elitism:
             selected.append(elite_idx)
         for i in order.tolist():
             if len(selected) >= config.k_parents:
                 break
+            if not eligible_mask[i]:
+                continue
             if i not in selected:
                 selected.append(i)
 
@@ -567,6 +606,7 @@ def run_search(
             "move_counts": move_counts,
             "jumps_used": jumps_used,
             "elite_combined_badness": float(combined_badness[elite_idx]),
+            "n_gated_out": n_gated_out,
         })
 
     return {"pool": pool, "log": log, "calls_made": calls_made}
