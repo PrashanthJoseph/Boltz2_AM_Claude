@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import subprocess
+import sys
 from typing import List, Sequence, Tuple
 
 import numpy as np
+import yaml
 
 # ============================================================
 # Fixed antibody context: everything except the 7 designable
@@ -36,22 +39,24 @@ def assemble_full_heavy_chain(cdrh3: str) -> str:
 # one uniquely-named file per candidate instead of one file total.
 # ============================================================
 
-def write_affinity_yaml(yaml_path: str, heavy_chain: str, light_chain: str, ligand_smiles: str) -> None:
+def write_affinity_yaml(yaml_path: str, heavy_chain: str, light_chain: str, ligand_smiles: str,
+                        ligand_id: str = "d") -> None:
+    # Matches the validated Colab notebook exactly: `version: 1` header (Boltz-2
+    # schema field the hand-written writer omitted) and yaml.safe_dump so odd
+    # characters in a SMILES/sequence can't corrupt the file.
+    yaml_data = {
+        "version": 1,
+        "sequences": [
+            {"protein": {"id": "H", "sequence": heavy_chain}},
+            {"protein": {"id": "L", "sequence": light_chain}},
+            {"ligand": {"id": ligand_id, "smiles": ligand_smiles}},
+        ],
+        "properties": [
+            {"affinity": {"binder": ligand_id}},
+        ],
+    }
     with open(yaml_path, "w") as f:
-        f.write("sequences:\n")
-        f.write("    - protein:\n")
-        f.write("        id: H\n")
-        f.write(f"        sequence: {heavy_chain}\n")
-        f.write("    - protein:\n")
-        f.write("        id: L\n")
-        f.write(f"        sequence: {light_chain}\n")
-        f.write("    - ligand:\n")
-        f.write("        id: d\n")
-        f.write(f"        smiles: '{ligand_smiles}'\n")
-        f.write("\n")
-        f.write("properties:\n")
-        f.write("    - affinity:\n")
-        f.write("        binder: d\n")
+        yaml.safe_dump(yaml_data, f, sort_keys=False, default_flow_style=False)
 
 
 def write_batch_yamls(batch_dir: str, candidates: Sequence[Tuple[str, str]]) -> None:
@@ -68,51 +73,72 @@ def write_batch_yamls(batch_dir: str, candidates: Sequence[Tuple[str, str]]) -> 
 
 
 # ============================================================
-# Batch Boltz-2 invocation -- same subprocess/env pattern as the user's
-# run_boltz, pointed at a directory instead of a single yaml file (the
-# `boltz predict` CLI loads the model once and runs every .yaml inside).
+# Batch Boltz-2 invocation. Points `boltz predict` at a directory (the CLI
+# loads the model once and runs every .yaml inside). Intended to run FROM
+# INSIDE the boltz environment (e.g. `conda run -n boltz2 python run_search.py`),
+# so it calls `boltz` directly rather than wrapping each call in `conda run`.
 # ============================================================
+
+def _nvidia_lib_dirs() -> List[str]:
+    """Every site-packages/nvidia/*/lib dir on sys.path's site-packages, so
+    boltz's CUDA libs are found regardless of the exact CUDA version pip
+    pulled -- replaces the old hardcoded, version-specific (and partly
+    nonexistent) 'nvidia/cu13/lib' path list."""
+    dirs: List[str] = []
+    for base in {os.path.dirname(os.path.dirname(p)) for p in sys.path if p.endswith("site-packages")} \
+            | {p for p in sys.path if p.endswith("site-packages")}:
+        dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
+    return sorted(set(dirs))
+
 
 def run_boltz_batch(
     batch_dir: str,
     out_dir: str,
     max_parallel_samples: int = 1,
     diffusion_samples: int = 1,
+    diffusion_samples_affinity: int = 5,
     use_msa_server: bool = True,
+    use_potentials: bool = True,
     accelerator: str = "gpu",
+    devices: int = 1,
+    num_workers: int = 2,
+    preprocessing_threads: int = 8,
+    override: bool = True,
 ) -> bool:
     cmd = [
-        "conda", "run", "-n", "boltz2",
-        "boltz", "predict", batch_dir,
-        "--max_parallel_samples", str(max_parallel_samples),
-        "--diffusion_samples", str(diffusion_samples),
-        "--use_potentials",
-        "--out_dir", out_dir,
+        "boltz", "predict", str(batch_dir),
+        "--out_dir", str(out_dir),
         "--accelerator", accelerator,
+        "--devices", str(devices),
+        "--diffusion_samples", str(diffusion_samples),
+        "--max_parallel_samples", str(max_parallel_samples),
+        "--diffusion_samples_affinity", str(diffusion_samples_affinity),
+        "--num_workers", str(num_workers),
     ]
+    if preprocessing_threads is not None:
+        cmd += ["--preprocessing-threads", str(preprocessing_threads)]
     if use_msa_server:
         cmd.append("--use_msa_server")
+    if use_potentials:
+        cmd.append("--use_potentials")
+    if override:
+        cmd.append("--override")
 
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = (
-        "/usr/local/envs/boltz2/lib/python3.10/site-packages/nvidia/cu13/lib:"
-        "/usr/local/envs/boltz2/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:"
-        "/usr/local/envs/boltz2/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib:"
-        "/usr/lib64-nvidia:"
-        + env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = ":".join(
+        _nvidia_lib_dirs() + ["/usr/lib64-nvidia", env.get("LD_LIBRARY_PATH", "")]
     )
 
     try:
-        result = subprocess.run(cmd, env=env, text=True, capture_output=True)
-        print(result.stdout)
+        # No capture_output: let Boltz progress stream live to the notebook,
+        # which matters across a multi-hour search. stderr surfaces on failure.
+        result = subprocess.run(cmd, env=env, text=True, check=False)
         if result.returncode != 0:
-            print(result.stderr)
             print(f"Boltz batch failed with exit code {result.returncode}")
             return False
-        print("Batch prediction completed successfully.\nFiles saved at:", out_dir)
         return True
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred launching Boltz: {e}")
         return False
 
 
@@ -121,12 +147,23 @@ def run_boltz_batch(
 # ============================================================
 
 def read_affinity_json(out_dir: str, unique_id: str) -> dict:
-    path = os.path.join(out_dir, "predictions", unique_id, f"affinity_{unique_id}.json")
+    # Boltz's exact output layout has varied across versions (e.g.
+    # <out>/predictions/<id>/affinity_<id>.json vs a boltz_results_* wrapper
+    # dir). Try the canonical path first, then fall back to a recursive glob
+    # for affinity_<id>.json anywhere under out_dir, so a layout change surfaces
+    # as "found elsewhere" rather than a spurious FileNotFoundError.
+    canonical = os.path.join(out_dir, "predictions", unique_id, f"affinity_{unique_id}.json")
+    path = canonical
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"No affinity output for candidate '{unique_id}' at {path} -- "
-            f"the Boltz batch call may have failed or silently skipped this candidate."
-        )
+        matches = glob.glob(os.path.join(out_dir, "**", f"affinity_{unique_id}.json"), recursive=True)
+        if matches:
+            path = matches[0]
+        else:
+            raise FileNotFoundError(
+                f"No affinity output for candidate '{unique_id}' under {out_dir} "
+                f"(looked for affinity_{unique_id}.json) -- the Boltz batch call may "
+                f"have failed or silently skipped this candidate."
+            )
     with open(path) as f:
         return json.load(f)
 

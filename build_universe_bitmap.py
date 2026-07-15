@@ -4,7 +4,11 @@ from typing import Sequence
 
 import numpy as np
 
-import LAP_inhouse as lap
+# LAP_inhouse (and its heavy abnumber/IMGT dependency) is imported LAZILY inside
+# the two build_universe_facts* functions -- it's only needed to BUILD the facts,
+# never to load them (load_facts_memmap) or apply a policy (apply_policy). Keeping
+# it off the module top means the search runtime, which only loads+queries facts,
+# doesn't need abnumber installed. hydro is abnumber-free, so it stays top-level.
 import hydrophobic_analysis as hydro
 
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
@@ -27,6 +31,7 @@ def build_universe_facts(
     policy this is designed to support, and derive_bitmap() for the cheap
     per-policy derivation.
     """
+    import LAP_inhouse as lap  # lazy: only the build path needs abnumber/IMGT
     n_design = len(designable_positions)
     base = len(alphabet)
     total = base ** n_design
@@ -98,6 +103,7 @@ def build_universe_facts_to_disk(
     defeats the point if RAM is tight. Returns `total` (needed later to
     reopen the files via load_facts_memmap).
     """
+    import LAP_inhouse as lap  # lazy: only the build path needs abnumber/IMGT
     n_design = len(designable_positions)
     base = len(alphabet)
     total = base ** n_design
