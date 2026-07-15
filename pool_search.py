@@ -7,7 +7,11 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
-import LAP_inhouse as lap
+# Safety is checked ONLY against precomputed facts (BitmapSafetyChecker), so
+# this module deliberately does NOT import LAP_inhouse -- that (and its heavy
+# `abnumber`/IMGT dependency) is only needed to BUILD the facts, never to run
+# the search. hydro is used every generation (strings_to_char_array); bub reads
+# the precomputed facts. Both are abnumber-free.
 import hydrophobic_analysis as hydro
 import build_universe_bitmap as bub
 
@@ -453,53 +457,12 @@ def propose_safe_children(
 
 
 # ============================================================
-# Candidate safety checking (LAP + hydrophobicity), pluggable
+# Candidate safety checking -- pluggable via the SafetyChecker protocol;
+# the search only depends on the protocol, not any concrete checker.
 # ============================================================
 
 class SafetyChecker(Protocol):
     def is_safe(self, design_substrings: Sequence[str]) -> np.ndarray: ...
-
-
-class LiveFilterSafetyChecker:
-    """Runs the real vectorized LAP + hydrophobicity filters on demand.
-    Correct for any pool size, but does real work every call — fine at the
-    small per-generation batch sizes this search proposes."""
-
-    def __init__(
-        self,
-        root_sequence: str,
-        designable_positions: Sequence[int],
-        n_high: int,
-        n_medium: int,
-        n_low: int,
-        max_allowed_patch_len: int = hydro.MIN_PATCH_LEN,
-    ) -> None:
-        # n_high/n_medium/n_low: max allowed count of non-Ngly/xCys High,
-        # Medium, and Low severity hits respectively -- Ngly/xCys are always
-        # hard-rejected regardless of these. See LAP_inhouse.passes_lap_policy.
-        # max_allowed_patch_len: rejection ceiling on longest hydrophobic
-        # patch -- lower it for stricter rejection of shorter patches.
-        self.root_sequence = root_sequence
-        self.designable_positions = designable_positions
-        self.n_high = n_high
-        self.n_medium = n_medium
-        self.n_low = n_low
-        self.max_allowed_patch_len = max_allowed_patch_len
-
-    def is_safe(self, design_substrings: Sequence[str]) -> np.ndarray:
-        if not design_substrings:
-            return np.zeros(0, dtype=bool)
-        full_seqs = [
-            assemble_full_sequence(self.root_sequence, self.designable_positions, d)
-            for d in design_substrings
-        ]
-        lap_ok = lap.passes_lap_policy(
-            full_seqs, n_high=self.n_high, n_medium=self.n_medium, n_low=self.n_low
-        )
-        hres = hydro.analyze_hydrophobicity_batch(
-            full_seqs, cdr_only_input=True, max_allowed_patch_len=self.max_allowed_patch_len
-        )
-        return lap_ok & hres["passes_patch_filter"]
 
 
 class BitmapSafetyChecker:
