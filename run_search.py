@@ -33,12 +33,16 @@ DESIGN_POS = (3, 4, 5, 6, 12, 13, 14)       # 0-based indices into ROOT
 N_DESIGN = len(DESIGN_POS)
 UNIVERSE_TOTAL = 20 ** N_DESIGN             # 20^7 = 1,280,000,000
 
-# --- safety policy (VERIFIED against the facts: no Ngly/xCys + high/med/low<=3
-#     + hydrophobic patch < 5 keeps 817,646,288 of 20^7, 63.88%) --------------
-N_HIGH = 3
-N_MEDIUM = 3
-N_LOW = 3
-MAX_ALLOWED_PATCH_LEN = 5   # policy is: max_patch_len < this (i.e. < 5)
+# --- safety-policy DEFAULTS (LAP severity-count caps for BitmapSafetyChecker;
+#     overridable via CLI). VERIFIED against the facts: no Ngly/xCys +
+#     high<=0, medium<=1, low<=1 + hydrophobic patch < 5 keeps 603,772,906 of
+#     20^7 (47.17%). NOTE: this is the SAFETY policy (which sequences are even
+#     allowed), separate from --score-cutoff (which safe candidates count as
+#     good binders). ------------------------------------------------------------
+DEFAULT_N_HIGH = 0
+DEFAULT_N_MEDIUM = 1
+DEFAULT_N_LOW = 1
+DEFAULT_MAX_ALLOWED_PATCH_LEN = 5   # policy is: max_patch_len < this (i.e. < 5)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,8 +60,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=8, help="Generations without improvement before stopping.")
     p.add_argument("--k-parents", type=int, default=8)
     p.add_argument("--k-children", type=int, default=8)
-    p.add_argument("--fitness-gate-tau", type=float, default=None,
-                   help="Optional quality gate (MADs below median). Off by default.")
+    p.add_argument("--score-cutoff", type=float, default=0.0,
+                   help="Qualified-population bar on S(x): Q = {S >= cutoff}. Parents are drawn "
+                        "from Q; progress is measured by the mean of Q. Default 0.0 (~ v<=-0.1, p>=0.63).")
+    p.add_argument("--demote-patience", type=int, default=3,
+                   help="Barren parent-events before a member is exhausted (barred from breeding). "
+                        "Set <=0 to disable demotion.")
+    # Safety policy (which sequences are allowed at all) -- caps on LAP severity
+    # counts; Ngly/xCys are always hard-rejected regardless. Defaults = 0/1/1.
+    p.add_argument("--n-high", type=int, default=DEFAULT_N_HIGH)
+    p.add_argument("--n-medium", type=int, default=DEFAULT_N_MEDIUM)
+    p.add_argument("--n-low", type=int, default=DEFAULT_N_LOW)
+    p.add_argument("--max-patch", type=int, default=DEFAULT_MAX_ALLOWED_PATCH_LEN,
+                   help="Reject if longest hydrophobic patch >= this (policy: patch < max-patch).")
     p.add_argument("--seed", type=int, default=0, help="RNG seed for reproducibility.")
     # Boltz knobs (forwarded to boltz predict); defaults match the validated notebook.
     p.add_argument("--diffusion-samples", type=int, default=1)
@@ -87,13 +102,15 @@ def main() -> None:
         raise ValueError("DESIGN_POS indexes past the end of ROOT.")
 
     print(f"Root: {ROOT} | designable positions: {DESIGN_POS}")
-    print(f"Policy: no Ngly/xCys, high<={N_HIGH}, medium<={N_MEDIUM}, low<={N_LOW}, "
-          f"patch<{MAX_ALLOWED_PATCH_LEN}")
+    print(f"Safety policy: no Ngly/xCys, high<={args.n_high}, medium<={args.n_medium}, "
+          f"low<={args.n_low}, patch<{args.max_patch}")
+    print(f"Reward policy: qualified population Q = {{S(x) >= {args.score_cutoff}}}; "
+          f"demote_patience={args.demote_patience}")
 
     facts = bub.load_facts_memmap(args.facts_prefix, UNIVERSE_TOTAL)
     safety = BitmapSafetyChecker(
-        facts, n_high=N_HIGH, n_medium=N_MEDIUM, n_low=N_LOW,
-        max_allowed_patch_len=MAX_ALLOWED_PATCH_LEN,
+        facts, n_high=args.n_high, n_medium=args.n_medium, n_low=args.n_low,
+        max_allowed_patch_len=args.max_patch,
     )
 
     os.makedirs(args.work_dir, exist_ok=True)
@@ -115,7 +132,8 @@ def main() -> None:
         k_children_per_parent=args.k_children,
         patience_generations=args.patience,
         max_boltz2_calls=args.max_calls,
-        fitness_gate_tau=args.fitness_gate_tau,
+        score_cutoff=args.score_cutoff,
+        demote_patience=(args.demote_patience if args.demote_patience > 0 else None),
     )
 
     log_path = args.log

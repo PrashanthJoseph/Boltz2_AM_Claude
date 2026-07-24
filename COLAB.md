@@ -116,6 +116,13 @@ Boltz affinity value + probability + S(x) + normalized_objective, written live),
 - **Cache the env to Drive** to skip the ~10 min rebuild on reconnect: after
   Cell 3, `tar czf` `/usr/local/envs/boltz2` to Drive, and restore + `tar xzf`
   on the next session instead of re-running Cells 2–3.
-- **`--fitness-gate-tau`** (default off) enables the quality gate (drop parents
-  more than τ MADs below the pool median); pass e.g. `--fitness-gate-tau 2.5`.
+- **Reward / population knobs.** `--score-cutoff` (default `0.0`) sets the
+  qualified population `Q = {S(x) ≥ cutoff}` — parents are drawn from `Q` and
+  progress is the mean of `Q` (robust to Boltz noise). `--demote-patience`
+  (default `3`) exhausts a parent after that many barren generations (barred
+  from breeding; `<=0` disables). `S(x)=0` ≈ `v ≤ −0.1, p ≥ 0.63`.
+- **Safety-policy flags.** `--n-high/--n-medium/--n-low` (default `0/1/1`) and
+  `--max-patch` (default `5`) set which sequences are allowed at all — this is
+  separate from `--score-cutoff` (which allowed candidates count as good
+  binders). Defaults keep 603,772,906 of 20^7 safe (47.17%).
 ```

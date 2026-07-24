@@ -89,27 +89,30 @@ class SearchConfig:
 
     elitism: bool = True
 
-    # fitness_gate_tau: quality gate on parent ELIGIBILITY. A member is
-    # parent-eligible only if its normalized_objective is no more than tau
-    # MADs BELOW the pool MEDIAN; everything further behind is excluded from
-    # selection REGARDLESS of how novel it is. This caps the "novelty rescue"
-    # ceiling (novelty can lift base_score by at most beta*(U_max - U_min)
-    # ~= 0.43 MAD, so without a gate an isolated mediocre member can
-    # persistently hold a parent slot in a sparse space).
-    #
-    # Reference is the MEDIAN, not the best: normalized_objective is already
-    # median-centered ((obj-med)/MAD), so the gate is simply "z >= -tau". This
-    # is deliberately robust to a runaway-best outlier -- a best-relative gate
-    # (AdaLead's mu*max_score analog) collapses to elite-only when one early
-    # hit sits many MADs above the pack, throttling exploration; the median is
-    # stable under that. The gate still excludes genuinely-bad members (well
-    # below typical) but never prunes members sitting near the pool's middle.
-    #
-    # None (default) = OFF, preserving prior behavior. The elite is always
-    # exempt (elitism re-adds it below), so the gate can never strand the
-    # best-found member. Sensible values are ~2-3 (MAD is scaled to std-like
-    # units, so tau reads as "how many sigma below typical is still allowed").
-    fitness_gate_tau: Optional[float] = None
+    # score_cutoff: absolute quality bar (in OBJECTIVE units = score_sign*S(x),
+    # higher is better) defining the QUALIFIED POPULATION Q = {members with
+    # objective >= score_cutoff}. This is the robust-to-noise reward idea:
+    #   - Parent eligibility = Q (with backfill, below) -- low binders are
+    #     IGNORED, not penalized ("forgive low binders").
+    #   - The search's progress/patience signal is the MEAN objective over Q,
+    #     not the single max ("don't over-prioritize one possibly-noisy top").
+    # 0.0 is calibrated for this project's S(x): S >= 0 corresponds roughly to
+    # affinity_value v ~ -0.1 with probability p >~ 0.63 (see boltz2_reward).
+    # Replaces the old MAD fitness gate.
+    score_cutoff: float = 0.0
+
+    # demote_patience: exhaustion mechanism. Each member tracks a barren streak
+    # = consecutive parent-events (generations it was actually selected as a
+    # parent) that produced ZERO "good" children, where good = child enters Q
+    # (objective >= score_cutoff) OR beats the parent's own objective. When the
+    # streak reaches demote_patience the member is EXHAUSTED: permanently removed
+    # from parent eligibility (elite and normal alike), so a played-out peak
+    # stops consuming Boltz budget and the forced-elite slot rotates to the next
+    # best non-exhausted member. Exhausted members stay in the pool and are still
+    # reported -- only breeding stops. None/<=0 disables demotion entirely.
+    # Each parent-event is ~k_children samples, so 3 ~= 24 poor children of
+    # evidence before giving up -- noise-tolerant but not glacial.
+    demote_patience: Optional[int] = 3
 
     # Safety policy (LAP severities, hydrophobic patch length) is NOT here --
     # it lives entirely in whichever SafetyChecker object is passed to
@@ -615,6 +618,22 @@ def run_search(
     generation = 0
     log: List[Dict] = []
 
+    # Demotion state: members whose lineage is played out (see demote_patience).
+    # barren_streak[i] = consecutive parent-events of member i with no good child.
+    exhausted: set = set()
+    barren_streak: Dict[int, int] = {}
+
+    # Progress signal baseline (population mean of the qualified set Q, or the
+    # max while Q is still empty). Improvement = Q grew OR its mean rose.
+    def population_signal() -> Tuple[int, float]:
+        obj = config.score_sign * np.array([m.score for m in pool])
+        q = obj[obj >= config.score_cutoff]
+        if len(q) > 0:
+            return len(q), float(q.mean())
+        return 0, float(obj.max())
+
+    prev_q_count, prev_q_mean = population_signal()
+
     while calls_made < config.max_boltz2_calls and generations_without_improve < config.patience_generations:
         generation += 1
 
@@ -686,33 +705,40 @@ def run_search(
             0.0, -((parent_delta / mad_parent_delta) + (bracket_delta / mad_bracket_delta))
         )
 
-        order = np.argsort(-base_score)  # all pool indices, descending by base_score
+        # --- Parent eligibility: qualified population Q minus exhausted -------
+        # Q = members with objective >= score_cutoff (the "good binders"); low
+        # binders are simply ignored, not penalized. Exhausted members (played-
+        # out lineages) are barred entirely. If fewer than k_parents remain,
+        # backfill with the best non-exhausted members below the cutoff so an
+        # ambitious cutoff can't stall the search during bootstrap.
+        non_exhausted = [i for i in range(len(pool)) if i not in exhausted]
+        if not non_exhausted:
+            # every member's lineage is exhausted -> nothing left to breed from
+            log.append({"generation": generation, "n_new": 0, "note": "all_exhausted",
+                        "calls_made": calls_made, "best_objective": float(objective.max())})
+            break
 
-        elite_idx = int(np.argmax(objective))
+        # forced-elite = best-scoring member that is NOT exhausted (rotates as
+        # peaks exhaust); distinct from the all-time best used for reporting.
+        elite_idx = max(non_exhausted, key=lambda i: objective[i])
 
-        # Fitness gate (optional quality floor): a member is parent-eligible
-        # only if its normalized_objective is no more than tau MADs below the
-        # pool median. normalized_objective is already median-centered and in
-        # MAD units, so the gate is just "z >= -tau". This runs on RAW fitness
-        # (no novelty term) on purpose -- the whole point is to stop novelty
-        # from keeping a low-scoring member eligible. The elite is exempt
-        # (re-added via elitism below), so the gate can never strand the
-        # best-found member even if numerical edge cases would exclude it.
-        if config.fitness_gate_tau is not None:
-            eligible_mask = normalized_objective >= -config.fitness_gate_tau
-            eligible_mask[elite_idx] = True
-        else:
-            eligible_mask = np.ones(len(pool), dtype=bool)
-        n_gated_out = int((~eligible_mask).sum())
+        eligible = [i for i in non_exhausted if objective[i] >= config.score_cutoff]
+        n_qualified = len(eligible)
+        if len(eligible) < config.k_parents:
+            eligible_set = set(eligible)
+            backfill = sorted((i for i in non_exhausted if i not in eligible_set),
+                              key=lambda i: -objective[i])
+            eligible += backfill[: config.k_parents - len(eligible)]
 
+        # Rank the eligible set by base_score (novelty diversifies within Q),
+        # force the elite in first if elitism is on.
+        eligible.sort(key=lambda i: -base_score[i])
         selected: List[int] = []
         if config.elitism:
             selected.append(elite_idx)
-        for i in order.tolist():
+        for i in eligible:
             if len(selected) >= config.k_parents:
                 break
-            if not eligible_mask[i]:
-                continue
             if i not in selected:
                 selected.append(i)
 
@@ -735,26 +761,47 @@ def run_search(
                 new_records.append((cand, parent_idx, hamming(cand, parent_design), mv))
                 seen.add(cand)
 
-        if not new_records:
-            generations_without_improve += 1
-            log.append({"generation": generation, "n_new": 0, "best_objective": float(objective.max()),
-                         "calls_made": calls_made, "beta": config.beta})
-            continue
+        # Score children (if any) and fold them into the pool, recording each
+        # child's objective grouped by its parent for the demotion check below.
+        children_by_parent: Dict[int, List[float]] = {}
+        if new_records:
+            full_seqs = [assemble_full_sequence(config.root_sequence, design_positions, d)
+                         for d, _, _, _ in new_records]
+            new_scores, new_extras = _split_score_return(score_fn(full_seqs))
+            calls_made += len(full_seqs)
+            first_new_idx = len(pool)
+            for (design, parent_idx, step, mv), s, extra in zip(new_records, new_scores, new_extras):
+                v, p = _vp(extra)
+                add_member(design, float(s), generation, parent_idx, step, mv,
+                           affinity_value=v, affinity_probability=p)
+                children_by_parent.setdefault(parent_idx, []).append(config.score_sign * float(s))
+            write_log_rows(range(first_new_idx, len(pool)))
 
-        full_seqs = [assemble_full_sequence(config.root_sequence, design_positions, d) for d, _, _, _ in new_records]
-        new_scores, new_extras = _split_score_return(score_fn(full_seqs))
-        calls_made += len(full_seqs)
+        # Demotion: update each selected parent's barren streak, then exhaust it
+        # if the streak reaches demote_patience. A parent is "productive" this
+        # generation if any of its children entered Q (objective >= cutoff) or
+        # beat the parent's own objective; a parent that produced no safe child
+        # at all counts as barren (its neighborhood is spent).
+        newly_exhausted: List[int] = []
+        if config.demote_patience and config.demote_patience > 0:
+            for p in selected:
+                kids = children_by_parent.get(p, [])
+                parent_obj = objective[p]
+                productive = any((k >= config.score_cutoff) or (k > parent_obj + 1e-9) for k in kids)
+                if productive:
+                    barren_streak[p] = 0
+                else:
+                    barren_streak[p] = barren_streak.get(p, 0) + 1
+                    if barren_streak[p] >= config.demote_patience:
+                        exhausted.add(p)
+                        newly_exhausted.append(p)
 
-        prev_best = float(objective.max())
-        first_new_idx = len(pool)
-        for (design, parent_idx, step, mv), s, extra in zip(new_records, new_scores, new_extras):
-            v, p = _vp(extra)
-            add_member(design, float(s), generation, parent_idx, step, mv,
-                       affinity_value=v, affinity_probability=p)
-        write_log_rows(range(first_new_idx, len(pool)))
-
-        cur_best = float((config.score_sign * np.array([m.score for m in pool])).max())
-        generations_without_improve = 0 if cur_best > prev_best + 1e-9 else generations_without_improve + 1
+        # Progress/patience on the qualified-population signal (Q grew OR its
+        # mean rose), not the single max -- robust to Boltz-2 noise.
+        q_count, q_mean = population_signal()
+        improved = (q_count > prev_q_count) or (q_mean > prev_q_mean + 1e-9)
+        generations_without_improve = 0 if improved else generations_without_improve + 1
+        prev_q_count, prev_q_mean = q_count, q_mean
 
         move_counts = {"increase": 0, "decrease": 0, "lateral": 0}
         for _, _, _, mv in new_records:
@@ -764,13 +811,17 @@ def run_search(
             "generation": generation,
             "n_new": len(new_records),
             "calls_made": calls_made,
-            "best_objective": cur_best,
+            "best_objective": float((config.score_sign * np.array([m.score for m in pool])).max()),
+            "q_count": q_count,
+            "q_mean": q_mean,
+            "n_qualified_parents": n_qualified,
+            "n_exhausted": len(exhausted),
+            "newly_exhausted": newly_exhausted,
             "beta": config.beta,
             "generations_without_improve": generations_without_improve,
             "move_counts": move_counts,
             "jumps_used": jumps_used,
             "elite_combined_badness": float(combined_badness[elite_idx]),
-            "n_gated_out": n_gated_out,
         })
 
     if log_file is not None:
